@@ -8,6 +8,10 @@ publish = false
 name = "IO_Event"
 crate-type = ["cdylib"]
 
+[profile.release]
+codegen-units = 1
+lto = "fat"
+
 [features]
 default = ["uring"]
 uring = []

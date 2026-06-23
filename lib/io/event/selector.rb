@@ -33,6 +33,10 @@ module IO::Event
 			end
 		end
 		
+		# Check if `io_uring` is supported on the current platform.
+		#
+		# @parameter env [Hash] The environment to read configuration from.
+		# @returns [Boolean | Nil] Whether `io_uring` is supported.
 		def self.uring_supported?(env = ENV)
 			return false unless const_defined?(:URing)
 			return false unless linux_platform?(env)
@@ -42,10 +46,18 @@ module IO::Event
 			end
 		end
 		
+		# Check if the current platform is Linux.
+		#
+		# @parameter env [Hash] The environment to read configuration from.
+		# @returns [Boolean] Whether the current platform is Linux.
 		def self.linux_platform?(env = ENV)
 			(env["IO_EVENT_PLATFORM"] || RUBY_PLATFORM).include?("linux")
 		end
 		
+		# Extract the Linux kernel version as a major/minor pair.
+		#
+		# @parameter env [Hash] The environment to read configuration from.
+		# @returns [Array(Integer) | Nil] The Linux kernel version, if it can be determined.
 		def self.linux_kernel_version(env = ENV)
 			release = env["IO_EVENT_KERNEL_RELEASE"] || Etc.uname[:release]
 			

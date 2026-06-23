@@ -1,8 +1,11 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
+#[cfg(unix)]
 use std::os::raw::c_int;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
+use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -1075,7 +1078,10 @@ fn selector_io_read(
         return Ok((-libc::EINVAL).into_value_with(ruby));
     }
 
+    #[cfg(unix)]
     let fd = io_descriptor(io)?;
+    #[cfg(not(unix))]
+    let _fd = io_descriptor(io)?;
     #[cfg(unix)]
     let flags = set_nonblock(fd)?;
 
@@ -1166,7 +1172,10 @@ fn selector_io_write(
         return Ok((-libc::EINVAL).into_value_with(ruby));
     }
 
+    #[cfg(unix)]
     let fd = io_descriptor(io)?;
+    #[cfg(not(unix))]
+    let _fd = io_descriptor(io)?;
     #[cfg(unix)]
     let flags = set_nonblock(fd)?;
 
@@ -1330,7 +1339,8 @@ fn selector_io_pwrite(
 
 fn process_status_wait(ruby: &Ruby, pid: i64, flags: i32) -> Result<Value, Error> {
     let process = ruby.module_process();
-    let wait_flags = flags | libc::WNOHANG;
+    let wnohang: i32 = process.const_get("WNOHANG")?;
+    let wait_flags = flags | wnohang;
 
     let status_class: Value = process.const_get("Status")?;
     let responds: bool = status_class.funcall("respond_to?", (Symbol::new("wait"),))?;

@@ -20,10 +20,13 @@ Gem::Specification.new do |spec|
 		"source_code_uri" => "https://github.com/socketry/io-event.git",
 	}
 	
-	spec.files = Dir["{context,ext,lib}/**/*", "*.md", base: __dir__]
+	spec.files = Dir["{context,ext,lib}/**/*", "*.md", base: __dir__].reject do |path|
+		path.start_with?("ext/.rb-sys/", "ext/target/") || path.end_with?(".bundle", ".so", ".dylib", ".dSYM")
+	end
 	spec.require_paths = ["lib"]
 	
 	spec.extensions = ["ext/extconf.rb"]
 	
 	spec.required_ruby_version = ">= 3.3"
+	spec.add_dependency "rb_sys", "~> 0.9", ">= 0.9.128"
 end

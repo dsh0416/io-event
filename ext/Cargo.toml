@@ -1,0 +1,23 @@
+[package]
+name = "io-event-native"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "IO_Event"
+crate-type = ["cdylib"]
+
+[features]
+default = ["uring"]
+uring = []
+experimental-uring = ["uring"]
+
+[dependencies]
+libc = "0.2.186"
+magnus = { version = "0.8.2", features = ["rb-sys"] }
+rb-sys = "0.9.128"
+tokio = { version = "1.52.3", features = ["net", "rt", "sync", "time"] }
+
+[build-dependencies]
+rb-sys-env = "0.2.3"

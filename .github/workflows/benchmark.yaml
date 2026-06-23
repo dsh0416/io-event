@@ -26,6 +26,14 @@ jobs:
       with:
         ruby-version: ${{matrix.ruby}}
         bundler-cache: true
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          ext/target
+        key: ${{runner.os}}-${{matrix.ruby}}-${{matrix.selector}}-cargo-${{hashFiles('ext/Cargo.lock')}}
 
     - name: Install packages (Ubuntu)
       if: matrix.os == 'ubuntu'
@@ -33,6 +41,8 @@ jobs:
 
     - name: Build extensions
       timeout-minutes: 5
+      env:
+        RB_SYS_CARGO_FEATURES: ${{matrix.selector == 'URing' && 'uring' || ''}}
       run: bundle exec bake build
 
     - name: Install wrk

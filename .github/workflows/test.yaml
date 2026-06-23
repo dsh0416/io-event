@@ -42,11 +42,60 @@ jobs:
       with:
         ruby-version: ${{matrix.ruby}}
         bundler-cache: true
-    
+    - uses: dtolnay/rust-toolchain@stable
+      if: ${{!contains(matrix.ruby, 'jruby') && !contains(matrix.ruby, 'truffleruby')}}
+    - uses: actions/cache@v4
+      if: ${{!contains(matrix.ruby, 'jruby') && !contains(matrix.ruby, 'truffleruby')}}
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          ext/target
+        key: ${{runner.os}}-${{matrix.ruby}}-cargo-${{hashFiles('ext/Cargo.lock')}}
+
+    - name: Run Rust tests
+      if: ${{!contains(matrix.ruby, 'jruby') && !contains(matrix.ruby, 'truffleruby')}}
+      working-directory: ext
+      run: cargo test
+
     - name: Install packages (Ubuntu)
       if: matrix.os == 'ubuntu'
       run: sudo apt-get install -y liburing-dev
     
     - name: Run tests
+      timeout-minutes: 10
+      run: bundle exec bake test
+
+  uring:
+    name: URing on ubuntu
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+    - uses: actions/checkout@v6
+    - uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: "3.4"
+        bundler-cache: true
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          ext/target
+        key: ${{runner.os}}-3.4-cargo-uring-${{hashFiles('ext/Cargo.lock')}}
+
+    - name: Install packages (Ubuntu)
+      run: sudo apt-get install -y liburing-dev
+
+    - name: Check URing feature
+      working-directory: ext
+      run: cargo check --features uring
+
+    - name: Run tests
+      env:
+        RB_SYS_CARGO_FEATURES: uring
+        IO_EVENT_SELECTOR: URing
       timeout-minutes: 10
       run: bundle exec bake test

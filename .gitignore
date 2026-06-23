@@ -13,5 +13,7 @@
 /ext/**/*.so
 /ext/**/*.bundle
 /ext/**/*.dSYM
+/ext/.rb-sys
+/ext/target
 
 /benchmark/server/compiled

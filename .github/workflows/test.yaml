@@ -46,8 +46,20 @@ jobs:
       with:
         ruby-version: ${{matrix.ruby}}
         bundler-cache: true
-    - uses: dtolnay/rust-toolchain@stable
+    - id: rust-toolchain
+      uses: dtolnay/rust-toolchain@stable
       if: ${{!contains(matrix.ruby, 'jruby') && !contains(matrix.ruby, 'truffleruby')}}
+    - name: Install GNU Rust toolchain (Windows)
+      if: ${{matrix.os == 'windows' && !contains(matrix.ruby, 'jruby') && !contains(matrix.ruby, 'truffleruby')}}
+      shell: bash
+      run: |
+        rustup toolchain install stable-x86_64-pc-windows-gnu
+        echo "RUSTUP_TOOLCHAIN=stable-x86_64-pc-windows-gnu" >> "$GITHUB_ENV"
+    - name: Configure bindgen (Windows)
+      if: ${{matrix.os == 'windows' && !contains(matrix.ruby, 'jruby') && !contains(matrix.ruby, 'truffleruby')}}
+      shell: bash
+      run: |
+        echo "BINDGEN_EXTRA_CLANG_ARGS=--target=x86_64-pc-windows-gnu -isystem C:/msys64/ucrt64/include" >> "$GITHUB_ENV"
     - uses: actions/cache@v4
       if: ${{!contains(matrix.ruby, 'jruby') && !contains(matrix.ruby, 'truffleruby')}}
       with:
@@ -55,7 +67,7 @@ jobs:
           ~/.cargo/registry
           ~/.cargo/git
           ext/target
-        key: ${{runner.os}}-${{matrix.ruby}}-cargo-${{hashFiles('ext/Cargo.lock')}}
+        key: ${{runner.os}}-${{matrix.ruby}}-cargo-${{steps.rust-toolchain.outputs.cachekey}}-${{hashFiles('ext/Cargo.lock')}}
 
     - name: Run Rust tests
       if: ${{!contains(matrix.ruby, 'jruby') && !contains(matrix.ruby, 'truffleruby')}}

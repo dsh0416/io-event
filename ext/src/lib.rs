@@ -28,6 +28,20 @@ type RawDescriptor = i64;
 
 #[cfg(unix)]
 extern "C" {
+    fn rb_io_buffer_get_bytes_for_writing(
+        buffer: rb_sys::VALUE,
+        base: *mut *mut c_void,
+        size: *mut usize,
+    );
+    fn rb_io_buffer_get_bytes_for_reading(
+        buffer: rb_sys::VALUE,
+        base: *mut *const c_void,
+        size: *mut usize,
+    );
+}
+
+#[cfg(unix)]
+extern "C" {
     fn rb_thread_call_without_gvl(
         func: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
         data1: *mut c_void,
@@ -41,6 +55,7 @@ enum BackendKind {
     EPoll,
     KQueue,
     IOCP,
+    #[cfg(all(target_os = "linux", feature = "uring"))]
     URing,
 }
 
@@ -298,6 +313,7 @@ struct IOCPSelector {
     core: RefCell<SelectorCore>,
 }
 
+#[cfg(all(target_os = "linux", feature = "uring"))]
 #[derive(TypedData)]
 #[magnus(class = "IO::Event::Selector::URing", free_immediately, mark, size)]
 struct URingSelector {
@@ -417,8 +433,10 @@ macro_rules! selector_impl {
 selector_impl!(EPollSelector, BackendKind::EPoll);
 selector_impl!(KQueueSelector, BackendKind::KQueue);
 selector_impl!(IOCPSelector, BackendKind::IOCP);
+#[cfg(all(target_os = "linux", feature = "uring"))]
 selector_impl!(URingSelector, BackendKind::URing);
 
+#[cfg(all(target_os = "linux", feature = "uring"))]
 impl URingSelector {
     fn io_pread(&self, args: &[Value]) -> Result<Value, Error> {
         let ruby = Ruby::get().unwrap();
@@ -898,6 +916,136 @@ fn platform_poll(
     Ok(Vec::new())
 }
 
+#[cfg(unix)]
+enum BufferIoOperation {
+    Read,
+    Write,
+    #[cfg(all(target_os = "linux", feature = "uring"))]
+    PRead(i64),
+    #[cfg(all(target_os = "linux", feature = "uring"))]
+    PWrite(i64),
+}
+
+#[cfg(unix)]
+impl BufferIoOperation {
+    fn writes_to_buffer(&self) -> bool {
+        match self {
+            Self::Read => true,
+            Self::Write => false,
+            #[cfg(all(target_os = "linux", feature = "uring"))]
+            Self::PRead(_) => true,
+            #[cfg(all(target_os = "linux", feature = "uring"))]
+            Self::PWrite(_) => false,
+        }
+    }
+
+    fn events(&self) -> i32 {
+        if self.writes_to_buffer() {
+            READABLE
+        } else {
+            WRITABLE
+        }
+    }
+
+    unsafe fn call(&mut self, fd: RawDescriptor, pointer: *mut c_void, length: usize) -> isize {
+        match self {
+            Self::Read => libc::read(fd, pointer, length),
+            Self::Write => libc::write(fd, pointer.cast_const(), length),
+            #[cfg(all(target_os = "linux", feature = "uring"))]
+            Self::PRead(from) => libc::pread(fd, pointer, length, *from as libc::off_t),
+            #[cfg(all(target_os = "linux", feature = "uring"))]
+            Self::PWrite(from) => libc::pwrite(fd, pointer.cast_const(), length, *from as libc::off_t),
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "uring"))]
+    fn advance(&mut self, amount: usize) {
+        match self {
+            Self::PRead(from) | Self::PWrite(from) => *from += amount as i64,
+            Self::Read | Self::Write => {}
+        }
+    }
+}
+
+#[cfg(unix)]
+fn selector_io_buffer_syscall(
+    ruby: &Ruby,
+    core: &RefCell<SelectorCore>,
+    fiber: Value,
+    io: Value,
+    buffer: Value,
+    fd: RawDescriptor,
+    mut length: usize,
+    mut offset: usize,
+    mut operation: BufferIoOperation,
+) -> Result<Value, Error> {
+    let (base, size) = if operation.writes_to_buffer() {
+        let mut base = std::ptr::null_mut::<c_void>();
+        let mut size = 0usize;
+        unsafe {
+            rb_io_buffer_get_bytes_for_writing(raw_from_value(buffer), &mut base, &mut size);
+        }
+        (base, size)
+    } else {
+        let mut base = std::ptr::null::<c_void>();
+        let mut size = 0usize;
+        unsafe {
+            rb_io_buffer_get_bytes_for_reading(raw_from_value(buffer), &mut base, &mut size);
+        }
+        (base.cast_mut(), size)
+    };
+
+    if offset > size {
+        return Ok((-libc::EINVAL).into_value_with(ruby));
+    }
+
+    let mut total = 0usize;
+    let mut maximum_size = size - offset;
+    loop {
+        if maximum_size == 0 {
+            break;
+        }
+
+        let result = unsafe {
+            operation.call(
+                fd,
+                base.cast::<u8>().add(offset).cast::<c_void>(),
+                maximum_size,
+            )
+        };
+
+        if result < 0 {
+            let errno = errno();
+            if length > 0 && try_again(errno) {
+                selector_io_wait(ruby, core, fiber, io, operation.events())?;
+                continue;
+            }
+
+            return Ok((-(errno as i64)).into_value_with(ruby));
+        }
+
+        if result == 0 {
+            break;
+        }
+
+        let result = result as usize;
+        total += result;
+        offset += result;
+
+        #[cfg(all(target_os = "linux", feature = "uring"))]
+        operation.advance(result);
+
+        if result >= length {
+            break;
+        }
+
+        length -= result;
+        maximum_size = size - offset;
+    }
+
+    Ok(total.into_value_with(ruby))
+}
+
 fn selector_io_read(
     ruby: &Ruby,
     core: &RefCell<SelectorCore>,
@@ -916,8 +1064,8 @@ fn selector_io_read(
     let fiber = args[0];
     let io = args[1];
     let buffer = args[2];
-    let mut length = value_to_usize(args[3])?;
-    let mut offset = if args.len() == 5 {
+    let length = value_to_usize(args[3])?;
+    let offset = if args.len() == 5 {
         value_to_usize(args[4])?
     } else {
         0
@@ -932,35 +1080,55 @@ fn selector_io_read(
     let flags = set_nonblock(fd)?;
 
     let result = (|| -> Result<Value, Error> {
-        let mut total = 0usize;
-        loop {
-            let result: i64 = buffer.funcall("read", (io, 0usize, offset))?;
-            if result < 0 {
-                let errno = -result as i32;
-                if length > 0 && try_again(errno) {
-                    selector_io_wait(ruby, core, fiber, io, READABLE)?;
-                    continue;
-                }
-
-                return Ok(result.into_value_with(ruby));
-            }
-
-            if result == 0 {
-                break;
-            }
-
-            let result = result as usize;
-            total += result;
-            offset += result;
-
-            if result >= length {
-                break;
-            }
-
-            length -= result;
+        #[cfg(unix)]
+        {
+            selector_io_buffer_syscall(
+                ruby,
+                core,
+                fiber,
+                io,
+                buffer,
+                fd,
+                length,
+                offset,
+                BufferIoOperation::Read,
+            )
         }
 
-        Ok(total.into_value_with(ruby))
+        #[cfg(not(unix))]
+        {
+            let mut length = length;
+            let mut offset = offset;
+            let mut total = 0usize;
+            loop {
+                let result: i64 = buffer.funcall("read", (io, 0usize, offset))?;
+                if result < 0 {
+                    let errno = -result as i32;
+                    if length > 0 && try_again(errno) {
+                        selector_io_wait(ruby, core, fiber, io, READABLE)?;
+                        continue;
+                    }
+
+                    return Ok(result.into_value_with(ruby));
+                }
+
+                if result == 0 {
+                    break;
+                }
+
+                let result = result as usize;
+                total += result;
+                offset += result;
+
+                if result >= length {
+                    break;
+                }
+
+                length -= result;
+            }
+
+            Ok(total.into_value_with(ruby))
+        }
     })();
 
     #[cfg(unix)]
@@ -987,8 +1155,8 @@ fn selector_io_write(
     let fiber = args[0];
     let io = args[1];
     let buffer = args[2];
-    let mut length = value_to_usize(args[3])?;
-    let mut offset = if args.len() == 5 {
+    let length = value_to_usize(args[3])?;
+    let offset = if args.len() == 5 {
         value_to_usize(args[4])?
     } else {
         0
@@ -1003,35 +1171,55 @@ fn selector_io_write(
     let flags = set_nonblock(fd)?;
 
     let result = (|| -> Result<Value, Error> {
-        let mut total = 0usize;
-        loop {
-            let result: i64 = buffer.funcall("write", (io, 0usize, offset))?;
-            if result < 0 {
-                let errno = -result as i32;
-                if length > 0 && try_again(errno) {
-                    selector_io_wait(ruby, core, fiber, io, WRITABLE)?;
-                    continue;
-                }
-
-                return Ok(result.into_value_with(ruby));
-            }
-
-            if result == 0 {
-                break;
-            }
-
-            let result = result as usize;
-            total += result;
-            offset += result;
-
-            if result >= length {
-                break;
-            }
-
-            length -= result;
+        #[cfg(unix)]
+        {
+            selector_io_buffer_syscall(
+                ruby,
+                core,
+                fiber,
+                io,
+                buffer,
+                fd,
+                length,
+                offset,
+                BufferIoOperation::Write,
+            )
         }
 
-        Ok(total.into_value_with(ruby))
+        #[cfg(not(unix))]
+        {
+            let mut length = length;
+            let mut offset = offset;
+            let mut total = 0usize;
+            loop {
+                let result: i64 = buffer.funcall("write", (io, 0usize, offset))?;
+                if result < 0 {
+                    let errno = -result as i32;
+                    if length > 0 && try_again(errno) {
+                        selector_io_wait(ruby, core, fiber, io, WRITABLE)?;
+                        continue;
+                    }
+
+                    return Ok(result.into_value_with(ruby));
+                }
+
+                if result == 0 {
+                    break;
+                }
+
+                let result = result as usize;
+                total += result;
+                offset += result;
+
+                if result >= length {
+                    break;
+                }
+
+                length -= result;
+            }
+
+            Ok(total.into_value_with(ruby))
+        }
     })();
 
     #[cfg(unix)]
@@ -1040,18 +1228,23 @@ fn selector_io_write(
     result
 }
 
+#[cfg(all(target_os = "linux", feature = "uring"))]
 fn selector_io_pread(
     ruby: &Ruby,
-    _core: &RefCell<SelectorCore>,
+    core: &RefCell<SelectorCore>,
     args: &[Value],
 ) -> Result<Value, Error> {
     if args.len() != 6 {
         return Err(Error::new(
             ruby.exception_arg_error(),
-            format!("wrong number of arguments (given {}, expected 6)", args.len()),
+            format!(
+                "wrong number of arguments (given {}, expected 6)",
+                args.len()
+            ),
         ));
     }
 
+    let fiber = args[0];
     let io = args[1];
     let buffer = args[2];
     let from = value_to_i64(args[3])?;
@@ -1062,22 +1255,46 @@ fn selector_io_pread(
         return Ok((-libc::EINVAL).into_value_with(ruby));
     }
 
-    let result: i64 = buffer.funcall("pread", (io, from, length, offset))?;
-    Ok(result.into_value_with(ruby))
+    #[cfg(unix)]
+    {
+        let fd = io_descriptor(io)?;
+        selector_io_buffer_syscall(
+            ruby,
+            core,
+            fiber,
+            io,
+            buffer,
+            fd,
+            length,
+            offset,
+            BufferIoOperation::PRead(from),
+        )
+    }
+
+    #[cfg(not(unix))]
+    {
+        let result: i64 = buffer.funcall("pread", (io, from, length, offset))?;
+        Ok(result.into_value_with(ruby))
+    }
 }
 
+#[cfg(all(target_os = "linux", feature = "uring"))]
 fn selector_io_pwrite(
     ruby: &Ruby,
-    _core: &RefCell<SelectorCore>,
+    core: &RefCell<SelectorCore>,
     args: &[Value],
 ) -> Result<Value, Error> {
     if args.len() != 6 {
         return Err(Error::new(
             ruby.exception_arg_error(),
-            format!("wrong number of arguments (given {}, expected 6)", args.len()),
+            format!(
+                "wrong number of arguments (given {}, expected 6)",
+                args.len()
+            ),
         ));
     }
 
+    let fiber = args[0];
     let io = args[1];
     let buffer = args[2];
     let from = value_to_i64(args[3])?;
@@ -1088,8 +1305,27 @@ fn selector_io_pwrite(
         return Ok((-libc::EINVAL).into_value_with(ruby));
     }
 
-    let result: i64 = buffer.funcall("pwrite", (io, from, length, offset))?;
-    Ok(result.into_value_with(ruby))
+    #[cfg(unix)]
+    {
+        let fd = io_descriptor(io)?;
+        selector_io_buffer_syscall(
+            ruby,
+            core,
+            fiber,
+            io,
+            buffer,
+            fd,
+            length,
+            offset,
+            BufferIoOperation::PWrite(from),
+        )
+    }
+
+    #[cfg(not(unix))]
+    {
+        let result: i64 = buffer.funcall("pwrite", (io, from, length, offset))?;
+        Ok(result.into_value_with(ruby))
+    }
 }
 
 fn process_status_wait(ruby: &Ruby, pid: i64, flags: i32) -> Result<Value, Error> {

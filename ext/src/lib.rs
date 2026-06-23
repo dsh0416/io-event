@@ -3,16 +3,16 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 #[cfg(unix)]
 use std::os::raw::c_int;
-use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(unix)]
 use std::sync::atomic::AtomicI32;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use magnus::gc;
 use magnus::value::{Opaque, ReprValue};
 use magnus::{
-    function, method, prelude::*, DataTypeFunctions, Error, IntoValue, RHash, Ruby, Symbol,
+    function, method, prelude::*, DataTypeFunctions, Error, IntoValue, KwArgs, RHash, Ruby, Symbol,
     TryConvert, TypedData, Value,
 };
 
@@ -198,7 +198,11 @@ impl SelectorCore {
     }
 
     fn remove_io_waiter(&mut self, token: usize) {
-        if let Some(index) = self.io_waiters.iter().position(|waiter| waiter.token == token) {
+        if let Some(index) = self
+            .io_waiters
+            .iter()
+            .position(|waiter| waiter.token == token)
+        {
             self.io_waiters.swap_remove(index);
         }
     }
@@ -400,12 +404,7 @@ macro_rules! selector_impl {
                 ruby.qnil().as_value()
             }
 
-            fn io_wait(
-                &self,
-                fiber: Value,
-                io: Value,
-                events: i32,
-            ) -> Result<Value, Error> {
+            fn io_wait(&self, fiber: Value, io: Value, events: i32) -> Result<Value, Error> {
                 let ruby = Ruby::get().unwrap();
                 selector_io_wait(&ruby, &self.core, fiber, io, events)
             }
@@ -420,12 +419,7 @@ macro_rules! selector_impl {
                 selector_io_write(&ruby, &self.core, args)
             }
 
-            fn process_wait(
-                &self,
-                fiber: Value,
-                pid: i64,
-                flags: i32,
-            ) -> Result<Value, Error> {
+            fn process_wait(&self, fiber: Value, pid: i64, flags: i32) -> Result<Value, Error> {
                 let ruby = Ruby::get().unwrap();
                 selector_process_wait(&ruby, &self.core, fiber, pid, flags)
             }
@@ -508,7 +502,24 @@ fn selector_raise(
 
     let current = ruby.fiber_current().as_value();
     let ready_id = core.borrow_mut().push_ready(current);
-    let result = args[0].funcall("raise", &args[1..]);
+    let raise_args = &args[1..];
+    let kwargs = raise_args
+        .last()
+        .and_then(|value| RHash::from_value(*value))
+        .filter(|hash| hash.get(Symbol::new("cause")).is_some());
+
+    let result = if let Some(kwargs) = kwargs {
+        match &raise_args[..raise_args.len() - 1] {
+            [] => args[0].funcall("raise", (KwArgs(kwargs),)),
+            [exception] => args[0].funcall("raise", (*exception, KwArgs(kwargs))),
+            [exception, message] => {
+                args[0].funcall("raise", (*exception, *message, KwArgs(kwargs)))
+            }
+            _ => args[0].funcall("raise", raise_args),
+        }
+    } else {
+        args[0].funcall("raise", raise_args)
+    };
     core.borrow_mut().remove_ready(ready_id);
     result
 }
@@ -957,7 +968,9 @@ impl BufferIoOperation {
             #[cfg(all(target_os = "linux", feature = "uring"))]
             Self::PRead(from) => libc::pread(fd, pointer, length, *from as libc::off_t),
             #[cfg(all(target_os = "linux", feature = "uring"))]
-            Self::PWrite(from) => libc::pwrite(fd, pointer.cast_const(), length, *from as libc::off_t),
+            Self::PWrite(from) => {
+                libc::pwrite(fd, pointer.cast_const(), length, *from as libc::off_t)
+            }
         }
     }
 
@@ -1470,7 +1483,10 @@ fn raw_from_value(value: Value) -> rb_sys::VALUE {
     unsafe { std::mem::transmute::<Value, rb_sys::VALUE>(value) }
 }
 
-unsafe fn raw_funcall0(receiver: rb_sys::VALUE, method: &'static [u8]) -> Result<rb_sys::VALUE, Error> {
+unsafe fn raw_funcall0(
+    receiver: rb_sys::VALUE,
+    method: &'static [u8],
+) -> Result<rb_sys::VALUE, Error> {
     magnus::rb_sys::protect(|| {
         let id = rb_sys::rb_intern(method.as_ptr().cast());
         rb_sys::rb_funcallv(receiver, id, 0, std::ptr::null())
@@ -1534,11 +1550,7 @@ unsafe extern "C" fn busy_blocking_operation(data: *mut c_void) -> *mut c_void {
 
     if result > 0 && libc::FD_ISSET(busy.read_fd, &read_fds) {
         let mut byte = 0u8;
-        let _ = libc::read(
-            busy.read_fd,
-            (&mut byte as *mut u8).cast::<c_void>(),
-            1,
-        );
+        let _ = libc::read(busy.read_fd, (&mut byte as *mut u8).cast::<c_void>(), 1);
         busy.cancelled.store(true, Ordering::SeqCst);
         busy.operation_result.store(-1, Ordering::SeqCst);
         (-1isize) as *mut c_void
@@ -1781,7 +1793,9 @@ impl WorkerPool {
 
         let work_ptr = (&mut *work as *mut WorkerCall).cast::<c_void>();
         let thread = unsafe {
-            magnus::rb_sys::protect(|| rb_sys::rb_thread_create(Some(worker_call_thread), work_ptr))?
+            magnus::rb_sys::protect(|| {
+                rb_sys::rb_thread_create(Some(worker_call_thread), work_ptr)
+            })?
         };
 
         let mut error = None;
@@ -1832,15 +1846,20 @@ impl WorkerPool {
             },
         )
         .unwrap();
-        hash.aset(Symbol::new("maximum_worker_count"), state.maximum_worker_count)
+        hash.aset(
+            Symbol::new("maximum_worker_count"),
+            state.maximum_worker_count,
+        )
+        .unwrap();
+        hash.aset(Symbol::new("call_count"), state.call_count)
             .unwrap();
-        hash.aset(Symbol::new("call_count"), state.call_count).unwrap();
         hash.aset(Symbol::new("completed_count"), state.completed_count)
             .unwrap();
         hash.aset(Symbol::new("cancelled_count"), state.cancelled_count)
             .unwrap();
         hash.aset(Symbol::new("shutdown"), state.shutdown).unwrap();
-        hash.aset(Symbol::new("current_queue_size"), 0usize).unwrap();
+        hash.aset(Symbol::new("current_queue_size"), 0usize)
+            .unwrap();
         hash
     }
 

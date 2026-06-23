@@ -705,44 +705,44 @@ describe IO::Event::Selector do
 			env = {"IO_EVENT_SELECTOR" => "invalid"}
 			expect{subject.default(env)}.to raise_exception(NameError)
 		end
-
+		
 		it "uses URing on Linux when the kernel is at least 5.11" do
 			env = {
 				"IO_EVENT_PLATFORM" => "x86_64-linux",
 				"IO_EVENT_KERNEL_RELEASE" => "5.11.0-generic",
 			}
 			remove_uring = false
-
+			
 			unless subject.const_defined?(:URing)
 				subject.const_set(:URing, Class.new)
 				remove_uring = true
 			end
-
+			
 			expect(subject.default(env)).to be == subject::URing
 		ensure
 			subject.send(:remove_const, :URing) if remove_uring
 		end
-
+		
 		it "does not use URing on Linux when the kernel is older than 5.11" do
 			env = {
 				"IO_EVENT_PLATFORM" => "x86_64-linux",
 				"IO_EVENT_KERNEL_RELEASE" => "5.10.0-generic",
 			}
 			remove_uring = false
-
+			
 			unless subject.const_defined?(:URing)
 				subject.const_set(:URing, Class.new)
 				remove_uring = true
 			end
-
+			
 			expect(subject.default(env) == subject::URing).to be == false
 		ensure
 			subject.send(:remove_const, :URing) if remove_uring
 		end
-
+		
 		it "parses the Linux kernel release" do
 			env = {"IO_EVENT_KERNEL_RELEASE" => "6.8.0-31-generic"}
-
+			
 			expect(subject.send(:linux_kernel_version, env)).to be == [6, 8]
 		end
 	end

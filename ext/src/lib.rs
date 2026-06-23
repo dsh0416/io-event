@@ -18,6 +18,9 @@ const PRIORITY: i32 = 2;
 const WRITABLE: i32 = 4;
 
 #[cfg(unix)]
+const RB_NOGVL_OFFLOAD_SAFE: u32 = 0x4;
+
+#[cfg(unix)]
 type RawDescriptor = c_int;
 
 #[cfg(windows)]
@@ -1318,7 +1321,7 @@ unsafe fn busy_run_without_gvl(data: *mut BusyOperationData) {
         data.cast::<c_void>(),
         Some(busy_unblock_function),
         data.cast::<c_void>(),
-        (rb_sys::RB_NOGVL_UBF_ASYNC_SAFE | rb_sys::RB_NOGVL_OFFLOAD_SAFE) as c_int,
+        (rb_sys::RB_NOGVL_UBF_ASYNC_SAFE | RB_NOGVL_OFFLOAD_SAFE) as c_int,
     );
     (*data).completed.store(true, Ordering::SeqCst);
 }
